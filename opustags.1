@@ -65,6 +65,12 @@ The output file can’t be the same as the input file.
 Overwrite the input file instead of creating a separate output file. It has the same effect as
 setting \fB--output\fP to the same path as the input file and enabling \fB--overwrite\fP.
 This option conflicts with \fB--output\fP.
+.IP
+Only the OpusTags pages are rewritten. The OpusHead page and every audio page are copied
+byte for byte, preserving their order, boundaries, sequence numbers, granule positions, and CRCs.
+A smaller comment header is padded back to its original size, and a larger one is accepted as long
+as it fits in the same number of pages. If it does not, the operation fails and the input file is
+left unchanged rather than disturbing the pagination of the rest of the stream.
 .TP
 .B \-y, \-\-overwrite
 By default, \fBopustags\fP refuses to overwrite an already-existing file.

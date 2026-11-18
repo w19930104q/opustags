@@ -493,17 +493,18 @@ static void output_cover(const ot::opus_tags& tags, const ot::options &opt)
  * Transform the OpusTags packet on the fly.
  *
  * The writer is optional. When writer is nullptr, opustags runs in read-only mode.
+ *
+ * The rewrite only ever touches the OpusTags pages: the OpusHead page and, more importantly, all
+ * the audio pages that follow the comment header are copied verbatim, preserving their order,
+ * boundaries, granule positions, sequence numbers, and CRCs. The new OpusTags packet is constrained
+ * to the same number of pages as the original one — shrunk packets are padded back to their exact
+ * original size, grown ones keep their smaller size as long as they still fit. If the new tags do
+ * not fit, the processing aborts and the original file is left untouched by the caller.
  */
 static void process(ot::ogg_reader& reader, ot::ogg_writer* writer, const ot::options &opt)
 {
 	bool focused = false; /*< the stream on which we operate is defined */
 	int focused_serialno; /*< when focused, the serialno of the focused stream */
-
-	/** When the number of pages the OpusTags packet takes differs from the input stream to the
-	 *  output stream, we need to renumber all the succeeding pages. If the input stream
-	 *  contains gaps, the offset will naively reproduce the gaps: page numbers 0 (1) 2 4 will
-	 *  become 0 (1 2) 3 5, where (…) is the OpusTags packet, and not 0 (1 2) 3 4. */
-	long pageno_offset = 0;
 
 	while (reader.next_page()) {
 		auto serialno = ogg_page_serialno(&reader.page);
@@ -522,7 +523,15 @@ static void process(ot::ogg_reader& reader, ot::ogg_writer* writer, const ot::op
 				writer->write_page(reader.page);
 		} else if (reader.absolute_page_no == 1) { // Comment header
 			ot::opus_tags tags;
-			reader.process_header_packet([&tags](ogg_packet& p) { tags = ot::parse_tags(p); });
+			size_t original_packet_size;
+			// process_header_packet consumes every page the tags packet spans and leaves the
+			// reader positioned on its last page, so absolute_page_no is now the index of the
+			// last tags page.
+			reader.process_header_packet([&](ogg_packet& p) {
+				tags = ot::parse_tags(p);
+				original_packet_size = static_cast<size_t>(p.bytes);
+			});
+			int tags_page_count = reader.absolute_page_no;
 			if (opt.cover_out)
 				output_cover(tags, opt);
 			edit_tags(tags, opt);
@@ -531,9 +540,13 @@ static void process(ot::ogg_reader& reader, ot::ogg_writer* writer, const ot::op
 					fflush(writer->file); // flush before calling the subprocess
 					edit_tags_interactively(tags, writer->path, opt);
 				}
+				// Pad the new packet back to the original size so every other page can be
+				// copied byte for byte, and double-check that libogg paginates it into exactly
+				// as many pages as the original OpusTags packet. If the new tags do not fit,
+				// pad_tags_packet aborts and the original file is preserved by run_single.
+				ot::pad_tags_packet(tags, original_packet_size);
 				auto packet = ot::render_tags(tags);
-				writer->write_header_packet(serialno, pageno, packet);
-				pageno_offset = writer->next_page_no - 1 - reader.absolute_page_no;
+				writer->write_header_packet(serialno, pageno, packet, tags_page_count);
 			} else {
 				if (opt.cover_out != "-") {
 					if (opt.print_vendor)
@@ -544,7 +557,8 @@ static void process(ot::ogg_reader& reader, ot::ogg_writer* writer, const ot::op
 				break;
 			}
 		} else if (writer) {
-			ot::renumber_page(reader.page, pageno + pageno_offset);
+			// All the pages past the comment header belong to other packets: forward them
+			// untouched. Their sequence numbers and granule positions must never be rewritten.
 			writer->write_page(reader.page);
 		}
 	}

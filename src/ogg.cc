@@ -107,7 +107,8 @@ void ot::ogg_writer::write_page(const ogg_page& page)
 		throw status {st::standard_error, "fwrite error: "s + strerror(errno)};
 }
 
-void ot::ogg_writer::write_header_packet(int serialno, int pageno, ogg_packet& packet)
+void ot::ogg_writer::write_header_packet(int serialno, int pageno, ogg_packet& packet,
+                                         int expected_page_count)
 {
 	ogg_logical_stream stream(serialno);
 	stream.b_o_s = (pageno != 0);
@@ -116,8 +117,16 @@ void ot::ogg_writer::write_header_packet(int serialno, int pageno, ogg_packet& p
 		throw status {ot::st::libogg_error, "ogg_stream_packetin failed"};
 
 	ogg_page page;
-	while (ogg_stream_flush(&stream, &page) != 0)
+	int page_count = 0;
+	while (ogg_stream_flush(&stream, &page) != 0) {
 		write_page(page);
+		++page_count;
+	}
+
+	if (expected_page_count != 0 && page_count != expected_page_count)
+		throw status {st::error,
+		              "The new tags do not fit in the original header pages. Refusing to "
+		              "change the pagination of the stream."};
 
 	if (ogg_stream_check(&stream) != 0)
 		throw status {st::libogg_error, "ogg_stream_check failed"};

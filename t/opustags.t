@@ -4,7 +4,7 @@ use strict;
 use warnings;
 use utf8;
 
-use Test::More tests => 66;
+use Test::More tests => 79;
 use Test::Deep qw(cmp_deeply re);
 
 use Digest::MD5;
@@ -296,13 +296,120 @@ unlink('out.opus');
 
 ####################################################################################################
 # Multiple-page tags
+#
+# The fixed sample multipage.opus carries an OpusTags packet spanning 3 pages, followed by regular
+# audio pages. Rewriting its tags must only touch the tags pages: every other page keeps its exact
+# bytes, order, boundaries, sequence number, granule position, and CRC.
 
-my $big_tags = "DATA=x\n" x 15000; # > 90K, which is over the max page size of 64KiB.
-is_deeply(opustags(qw(-S gobble.opus -o out.opus), {in => $big_tags}), ['', '', 0], 'write multi-page header');
-is_deeply(opustags('out.opus'), [$big_tags, '', 0], 'read multi-page header');
-is_deeply(opustags(qw(out.opus -i -D -a), 'encoder=Lavc58.18.100 libopus'), ['', '', 0], 'shrink the header');
-is(md5('out.opus'), '111a483596ac32352fbce4d14d16abd2', 'the result is identical to the original file');
-unlink('out.opus');
+my $TAGS_PAGES = 3; # pages 1..3 of multipage.opus are the OpusTags packet.
+
+sub ogg_pages {
+	my ($file) = @_;
+	open(my $fh, '<', $file) or die "cannot open $file: $!";
+	binmode($fh);
+	local $/;
+	my $data = <$fh>;
+	my @pages;
+	my $off = 0;
+	while ($off < length($data)) {
+		die "lost Ogg sync at byte $off in $file" unless substr($data, $off, 4) eq 'OggS';
+		my $nseg = ord(substr($data, $off + 26, 1));
+		my $segtab = substr($data, $off + 27, $nseg);
+		my $body_len = 0;
+		$body_len += ord($_) for split(//, $segtab);
+		my $header_len = 27 + $nseg;
+		push(@pages, {
+			offset => $off,
+			header => substr($data, $off, $header_len),
+			body   => substr($data, $off + $header_len, $body_len),
+			type   => ord(substr($data, $off + 5, 1)),
+			gran   => unpack('Q<', substr($data, $off + 6, 8)),
+			serial => unpack('V',  substr($data, $off + 14, 4)),
+			seq    => unpack('V',  substr($data, $off + 18, 4)),
+			crc    => unpack('V',  substr($data, $off + 22, 4)),
+			segtab => [map { ord($_) } split(//, $segtab)],
+			total  => $header_len + $body_len,
+		});
+		$off += $header_len + $body_len;
+	}
+	return @pages;
+}
+
+# Compare the pages that are not part of the OpusTags packet (the OpusHead page and every audio
+# page). When $check_offsets is true, also require identical byte offsets, which is only possible
+# when the tags region kept its exact size. Returns undef on success, otherwise an explanation.
+sub non_tags_pages {
+	my ($original, $edited, $check_offsets) = @_;
+	my @a = ogg_pages($original);
+	my @b = ogg_pages($edited);
+	return "page count differs ($#a vs $#b)" unless @a == @b;
+	for my $i (0 .. $#a) {
+		next if $i >= 1 && $i <= $TAGS_PAGES; # the tags pages are allowed to change
+		my ($pa, $pb) = ($a[$i], $b[$i]);
+		return "page $i offset differs"           if $check_offsets && $pa->{offset} != $pb->{offset};
+		return "page $i header bytes differ"       unless $pa->{header} eq $pb->{header};
+		return "page $i body bytes differ"         unless $pa->{body}   eq $pb->{body};
+		return "page $i sequence number differs"   unless $pa->{seq}    == $pb->{seq};
+		return "page $i granule position differs"  unless $pa->{gran}   == $pb->{gran};
+		return "page $i flags differ"              unless $pa->{type}   == $pb->{type};
+		return "page $i lacing differs"            unless join(',', @{$pa->{segtab}})
+		                                                     eq join(',', @{$pb->{segtab}});
+	}
+	return;
+}
+
+my $fixture_tag = "DATA=" . ("x" x 200) . "\n";
+is(scalar(ogg_pages('multipage.opus')), 6, 'the multi-page fixture has 6 pages');
+is_deeply(opustags('multipage.opus'), [$fixture_tag x 650, '', 0], 'read multi-page tags');
+
+# Shrink the tags: the packet is padded back to its exact original size.
+copy('multipage.opus', 'out.opus');
+is_deeply(opustags(qw(out.opus -i -D -a), 'TITLE=shrunk'), ['', '', 0], 'shrink multi-page tags');
+ok(!defined non_tags_pages('multipage.opus', 'out.opus', 1),
+   'shrinking leaves every non-tags page byte-identical at the same offset');
+is(-s 'out.opus', -s 'multipage.opus', 'shrinking preserves the total file size');
+is_deeply(opustags('out.opus'), [<<"EOF", '', 0], 'the shrunk tags are readable');
+TITLE=shrunk
+EOF
+
+# Grow the tags while they still fit in the same 3 pages: no renumbering, no boundary change. The
+# tags region gets larger, so the audio pages shift in the file but stay byte-identical.
+copy('multipage.opus', 'grow.opus');
+my @grown = map { "GROW$_=" . ('y' x 100) } 1 .. 12;
+is_deeply(opustags('grow.opus', '-i', map { ('-a', $_) } @grown),
+          ['', '', 0], 'grow multi-page tags within the original pages');
+ok(!defined non_tags_pages('multipage.opus', 'grow.opus', 0),
+   'growing leaves every non-tags page byte-identical with unchanged sequence numbers');
+is(scalar(ogg_pages('grow.opus')), scalar(ogg_pages('multipage.opus')),
+   'growing does not add or remove any page');
+
+# Idempotency: applying the exact same edit twice yields byte-identical files.
+copy('multipage.opus', 'idem1.opus');
+copy('multipage.opus', 'idem2.opus');
+opustags(qw(idem1.opus -i -D -a), 'TITLE=same');
+opustags(qw(idem2.opus -i -D -a), 'TITLE=same');
+is(md5('idem1.opus'), md5('idem2.opus'), 'repeating the same edit is idempotent');
+
+# Rewriting a file with the same tags it already contains reproduces it byte for byte.
+copy('multipage.opus', 'noop.opus');
+is_deeply(opustags(qw(noop.opus -i)), ['', '', 0], 'rewrite multi-page tags without changes');
+is(md5('noop.opus'), md5('multipage.opus'), 'a no-op rewrite is byte-identical');
+
+# Overflow: tags that need more pages than the original are refused, and the original file is
+# restored (the temporary partial file is removed). 30000 lines make a ~210 KiB packet, which
+# needs 4 pages while the fixture only has 3 tags pages.
+copy('multipage.opus', 'overflow.opus');
+my $overflow_md5 = md5('overflow.opus');
+my $overflow_result = opustags(qw(-S -i overflow.opus),
+                               {in => "DATA=z\n" x 30000, mode => ':raw'});
+is($overflow_result->[0], '', 'overflow produces no stdout');
+like($overflow_result->[1], qr/do not fit in the original header pages/,
+     'refuse tags that would change the pagination');
+is($overflow_result->[2], 256, 'overflow exits with a failure status');
+is(md5('overflow.opus'), $overflow_md5, 'the original file is restored after a failed rewrite');
+ok(!(glob 'overflow.opus*.part'), 'no partial file is left after a failed rewrite');
+
+unlink('out.opus', 'grow.opus', 'idem1.opus', 'idem2.opus', 'noop.opus', 'overflow.opus');
 
 ####################################################################################################
 # Cover arts

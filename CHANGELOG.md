@@ -1,6 +1,19 @@
 opustags changelog
 ==================
 
+Unreleased
+----------
+
+- In-place and read-write tag edition now only rewrites the OpusTags pages. Every other Ogg page
+  (OpusHead and the audio packets) is copied verbatim, keeping its order, boundaries, sequence
+  number, granule position, and CRC intact. Players that seek on the original page layout are no
+  longer disturbed.
+
+  Rewriting a smaller tags packet pads it back to its exact original size with zero bytes in the
+  trailing extra data, so the whole file keeps its size and layout. A larger packet is accepted as
+  long as it still fits in the same number of pages. When it would need more pages, the operation
+  aborts and the original file is left untouched instead of renumbering the following pages.
+
 1.10.1 - 2024-05-19
 -------------------
 

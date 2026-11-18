@@ -307,8 +307,12 @@ struct ogg_writer {
 	/**
 	 * Write a header packet and flush the page. Header packets are always placed alone on their
 	 * pages.
+	 *
+	 * When page_count is not 0, the packet must paginate into exactly that many pages, otherwise
+	 * an exception is thrown. This is what makes the in-place edition preserve the pagination of
+	 * the rest of the stream.
 	 */
-	void write_header_packet(int serialno, int pageno, ogg_packet& packet);
+	void write_header_packet(int serialno, int pageno, ogg_packet& packet, int page_count = 0);
 	/**
 	 * Output file. It should be opened in binary mode. We use it to write whole pages,
 	 * represented as a block of data and a length.
@@ -397,6 +401,30 @@ opus_tags parse_tags(const ogg_packet& packet);
  * Serialize an #opus_tags object into an OpusTags Ogg packet.
  */
 dynamic_ogg_packet render_tags(const opus_tags& tags);
+
+/**
+ * Number of Ogg pages libogg emits when paginating a packet of the given size.
+ *
+ * The lacing rules make a page hold at most 255 full segments of 255 bytes, so a 65025-byte
+ * packet needs an extra page containing only a zero-length segment, and so on for every multiple.
+ */
+int packet_page_count(size_t packet_size);
+
+/**
+ * Maximum packet size, in bytes, that fits on the given number of Ogg pages.
+ */
+size_t max_packet_size(int page_count);
+
+/**
+ * Make sure the rendered tags packet keeps the same pagination as a packet of
+ * original_packet_size, without ever needing more pages.
+ *
+ * A packet that shrank is grown back to its exact original size by appending zero bytes, which are
+ * valid padding inside the trailing extra data of an OpusTags packet (RFC 7845, section 5.2). A
+ * packet that grew but still fits is left untouched. When it would need more pages than the
+ * original, an exception is thrown so the caller can abort and preserve the original file.
+ */
+void pad_tags_packet(opus_tags& tags, size_t original_packet_size);
 
 /**
  * Extracted data from the METADATA_BLOCK_PICTURE tag. See

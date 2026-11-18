@@ -117,6 +117,44 @@ ot::dynamic_ogg_packet ot::render_tags(const opus_tags& tags)
 }
 
 /**
+ * Maximum number of packet bytes that can be carried by a single Ogg page: 255 lacing values of
+ * 255 bytes each. A packet exactly this large still spills onto a second page (as an empty,
+ * zero-lacing segment), which is why the boundary is expressed with packet_size + 1 below.
+ */
+static constexpr size_t MAX_PAGE_BODY = 255 * 255; // 65025
+
+int ot::packet_page_count(size_t packet_size)
+{
+	return static_cast<int>((packet_size + 1 + MAX_PAGE_BODY - 1) / MAX_PAGE_BODY);
+}
+
+size_t ot::max_packet_size(int page_count)
+{
+	return static_cast<size_t>(page_count) * MAX_PAGE_BODY - 1;
+}
+
+void ot::pad_tags_packet(opus_tags& tags, size_t original_packet_size)
+{
+	int page_count = packet_page_count(original_packet_size);
+	size_t capacity = max_packet_size(page_count);
+
+	dynamic_ogg_packet probe = render_tags(tags);
+	size_t current_size = static_cast<size_t>(probe.bytes);
+	if (current_size > capacity)
+		throw status {st::error,
+		              "The new tags do not fit in the original header pages. Refusing to "
+		              "change the pagination of the stream."};
+
+	// When the packet shrank, pad it back to its exact original size. That preserves not only
+	// the page count but also the byte offsets of every following page, so the rest of the file
+	// is reproduced byte for byte. When it grew but still fits, leave it alone: padding to the
+	// original size is impossible anyway, and the unchanged page count is enough to keep the
+	// other packets' page boundaries, sequence numbers, and granule positions intact.
+	if (current_size < original_packet_size)
+		tags.extra_data.append(original_packet_size - current_size, '\0');
+}
+
+/**
  * The METADATA_BLOCK_PICTURE binary data, after base64 decoding, is organized like this:
  *
  *  - 4 bytes for the picture type,

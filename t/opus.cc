@@ -181,14 +181,96 @@ static void make_cover()
 	opaque_is(ot::make_cover("\x89PNG Picture data"sv), expected, "build the picture tag");
 }
 
+/**
+ * Check the packet size <-> page count arithmetic, in particular the lacing boundary where a
+ * packet of exactly 255*255 bytes spills onto an extra zero-lacing page.
+ */
+static void page_count_math()
+{
+	if (ot::packet_page_count(0) != 1)
+		throw failure("an empty packet still takes one page");
+	if (ot::packet_page_count(62) != 1)
+		throw failure("a small packet takes a single page");
+	if (ot::packet_page_count(65024) != 1)
+		throw failure("65024 bytes should fit on a single page");
+	if (ot::packet_page_count(65025) != 2)
+		throw failure("65025 bytes spill on a second zero-lacing page");
+	if (ot::packet_page_count(65026) != 2)
+		throw failure("65026 bytes take two pages");
+	if (ot::packet_page_count(130050) != 3)
+		throw failure("130050 bytes take three pages");
+
+	// max_packet_size must be the exact inverse of packet_page_count.
+	for (int pages = 1; pages <= 3; ++pages) {
+		size_t max_size = ot::max_packet_size(pages);
+		if (ot::packet_page_count(max_size) != pages)
+			throw failure("max_packet_size does not fit in the requested page count");
+		if (ot::packet_page_count(max_size + 1) != pages + 1)
+			throw failure("max_packet_size + 1 must spill onto another page");
+	}
+}
+
+static void padding_preserves_size()
+{
+	// A packet that shrank must be padded back to its exact original size, with plain zero bytes
+	// appended to the extra data.
+	ot::opus_tags tags;
+	tags.vendor = u8"v";
+	tags.comments = {u8"A=1"};
+	size_t original_size = 5000;
+	ot::pad_tags_packet(tags, original_size);
+	auto packet = ot::render_tags(tags);
+	if (static_cast<size_t>(packet.bytes) != original_size)
+		throw failure("shrunk packet was not padded back to its original size");
+	if (ot::packet_page_count(packet.bytes) != ot::packet_page_count(original_size))
+		throw failure("padding changed the pagination");
+}
+
+static void padding_allows_growth_within_pages()
+{
+	// Growing while staying inside the original page span is allowed and needs no padding: the
+	// page count is unchanged, and the following pages keep their boundaries and sequence
+	// numbers.
+	ot::opus_tags tags;
+	tags.vendor = u8"v";
+	tags.comments = {u8"A=" + std::u8string(100, u8'x')};
+	size_t original_size = 62; // the original, smaller single-page packet
+	size_t before = ot::render_tags(tags).bytes;
+	ot::pad_tags_packet(tags, original_size);
+	if (ot::render_tags(tags).bytes != before)
+		throw failure("a grown packet that still fits must not be padded");
+	if (ot::packet_page_count(ot::render_tags(tags).bytes) != 1)
+		throw failure("the grown packet must stay on a single page");
+}
+
+static void padding_rejects_overflow()
+{
+	// A packet that would need more pages than the original must be rejected rather than disturb
+	// the pagination of the rest of the stream.
+	ot::opus_tags tags;
+	tags.vendor = u8"v";
+	tags.comments = {u8"A=" + std::u8string(65024, u8'x')};
+	try {
+		ot::pad_tags_packet(tags, 62); // original packet fit on a single page
+		throw failure("an overflowing packet was not rejected");
+	} catch (const ot::status& rc) {
+		if (rc != ot::st::error)
+			throw failure("unexpected status code for an overflowing packet");
+	}
+}
+
 int main()
 {
-	std::cout << "1..6\n";
+	std::cout << "1..10\n";
 	run(parse_standard, "parse a standard OpusTags packet");
 	run(parse_corrupted, "correctly reject invalid packets");
 	run(recode_standard, "recode a standard OpusTags packet");
 	run(recode_padding, "recode a OpusTags packet with padding");
 	run(extract_cover, "extract the cover art");
 	run(make_cover, "encode the cover art");
+	run(page_count_math, "packet size to page count arithmetic");
+	run(padding_preserves_size, "pad a shrunk packet to its original size");
+	run(padding_allows_growth_within_pages, "allow growth within the original pages");
+	run(padding_rejects_overflow, "reject tags overflowing the original pages");
 	return 0;
 }
